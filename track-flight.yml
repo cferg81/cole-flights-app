@@ -1,0 +1,108 @@
+# Start from the GitHub app on your phone: Actions -> Track flight -> Run workflow.
+# Runs in GitHub's cloud, so it keeps going while your phone is off.
+# GitHub jobs max out at 6 hours, so long flights automatically hand over to a fresh job.
+
+name: Track flight
+run-name: ${{ inputs.test_message && 'Test message' || format('{0} {1}→{2} [{3}]', inputs.flight, inputs.from, inputs.to, inputs.phase) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_message:
+        description: "Just send a test message to the family"
+        type: boolean
+        default: false
+      flight:
+        description: "Flight number (QF9) or ICAO callsign (QFA9)"
+        required: false
+        default: ""
+      registration:
+        description: "Aircraft registration, e.g. VH-ZNA (optional)"
+        required: false
+        default: ""
+      from:
+        description: "From airport (optional, e.g. MEL)"
+        required: false
+        default: ""
+      to:
+        description: "To airport (optional, e.g. LHR)"
+        required: false
+        default: ""
+      takeoff_alt:
+        description: "Taken off above (ft)"
+        required: true
+        default: "1000"
+      landed_alt:
+        description: "Landed below (ft)"
+        required: true
+        default: "200"
+      phase:
+        description: "Leave as 'waiting' (used internally for long flights)"
+        type: choice
+        options: [waiting, airborne]
+        default: waiting
+      chain:
+        description: "Leave as 0 (used internally for long flights)"
+        required: false
+        default: "0"
+
+permissions:
+  actions: write     # lets a long flight start its own follow-on job
+  contents: read
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Watch the flight
+        id: run
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TWILIO_SID: ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          SMS_TO: ${{ secrets.SMS_TO }}
+          YOUR_NAME: ${{ vars.YOUR_NAME }}
+          TRACKING_LINK: ${{ vars.TRACKING_LINK }}
+          TZ: ${{ vars.TIMEZONE || 'Australia/Hobart' }}
+          IN_FLIGHT: ${{ inputs.flight }}
+          IN_REG: ${{ inputs.registration }}
+          IN_FROM: ${{ inputs.from }}
+          IN_TO: ${{ inputs.to }}
+          IN_TAKEOFF: ${{ inputs.takeoff_alt }}
+          IN_LANDED: ${{ inputs.landed_alt }}
+          IN_PHASE: ${{ inputs.phase }}
+          IN_CHAIN: ${{ inputs.chain }}
+          IN_TEST: ${{ inputs.test_message }}
+        run: |
+          if [ "$IN_TEST" = "true" ]; then
+            python3 flight_notifier.py --test-notify --config none
+            exit 0
+          fi
+          EXTRA=""
+          if [ "$IN_CHAIN" != "0" ]; then EXTRA="--no-start-message"; fi
+          python3 flight_notifier.py \
+            --flight "$IN_FLIGHT" --reg "$IN_REG" --from "$IN_FROM" --to "$IN_TO" \
+            --takeoff-alt "$IN_TAKEOFF" --landed-alt "$IN_LANDED" \
+            --phase "$IN_PHASE" --run-limit-minutes 340 --config none $EXTRA
+
+      - name: Hand over to a fresh job (long flights)
+        if: (steps.run.outputs.result == 'waiting' || steps.run.outputs.result == 'airborne') && inputs.chain < 4
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_FLIGHT: ${{ inputs.flight }}
+          IN_REG: ${{ inputs.registration }}
+          IN_FROM: ${{ inputs.from }}
+          IN_TO: ${{ inputs.to }}
+          IN_TAKEOFF: ${{ inputs.takeoff_alt }}
+          IN_LANDED: ${{ inputs.landed_alt }}
+          NEXT_PHASE: ${{ steps.run.outputs.result }}
+          IN_CHAIN: ${{ inputs.chain }}
+        run: |
+          gh workflow run track-flight.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            -f flight="$IN_FLIGHT" -f registration="$IN_REG" -f from="$IN_FROM" -f to="$IN_TO" \
+            -f takeoff_alt="$IN_TAKEOFF" -f landed_alt="$IN_LANDED" \
+            -f phase="$NEXT_PHASE" -f chain="$((IN_CHAIN + 1))"
